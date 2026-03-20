@@ -18,15 +18,19 @@ import (
 
 // Device implements hal.Device for OpenGL on Linux.
 type Device struct {
-	glCtx         *gl.Context
-	eglCtx        *egl.Context
-	displayHandle uintptr
-	windowHandle  uintptr
-	vao           uint32 // persistent VAO (Core Profile requires one bound)
+	glCtx           *gl.Context
+	eglCtx          *egl.Context
+	displayHandle   uintptr
+	windowHandle    uintptr
+	vao             uint32 // persistent VAO (Core Profile requires one bound)
+	maxTextureUnits int32  // GL_MAX_TEXTURE_IMAGE_UNITS (queried at init)
 }
 
 // CreateBuffer creates a GPU buffer.
 func (d *Device) CreateBuffer(desc *BufferDescriptor) (hal.Buffer, error) {
+	if desc == nil {
+		return nil, fmt.Errorf("BUG: buffer descriptor is nil in GLES.CreateBuffer — core validation gap")
+	}
 	id := d.glCtx.GenBuffers(1)
 
 	// Determine GL buffer target from usage
@@ -148,9 +152,11 @@ func (d *Device) CreateTexture(desc *TextureDescriptor) (hal.Texture, error) {
 	}
 
 	// Set default texture parameters (multisample textures don't support these).
+	// GL sampler objects override these when bound, but they provide reasonable
+	// defaults when no sampler is explicitly used.
 	if target != gl.TEXTURE_2D_MULTISAMPLE {
-		d.glCtx.TexParameteri(target, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-		d.glCtx.TexParameteri(target, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+		d.glCtx.TexParameteri(target, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+		d.glCtx.TexParameteri(target, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
 		d.glCtx.TexParameteri(target, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
 		d.glCtx.TexParameteri(target, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 	}
@@ -210,11 +216,14 @@ func (d *Device) DestroyTextureView(view hal.TextureView) {
 	// TextureViews don't hold GL resources in OpenGL
 }
 
-// CreateSampler creates a texture sampler.
+// CreateSampler creates a texture sampler using GL sampler objects (GL 3.3+).
 func (d *Device) CreateSampler(desc *SamplerDescriptor) (hal.Sampler, error) {
-	// For now, use texture-bound sampler state
-	// Note: GL sampler objects (GL 3.3+) would allow independent sampler state.
+	if desc == nil {
+		return &Sampler{glCtx: d.glCtx}, nil
+	}
+	id := configureSampler(d.glCtx, desc)
 	return &Sampler{
+		id:    id,
 		glCtx: d.glCtx,
 	}, nil
 }
@@ -383,10 +392,12 @@ func (d *Device) CreateRenderPipeline(desc *RenderPipelineDescriptor) (hal.Rende
 		"vertexEntry", desc.Vertex.EntryPoint,
 	)
 
-	// Extract blend state from the first color target.
+	// Extract blend state and color write mask from the first color target.
 	var blend *gputypes.BlendState
+	colorWriteMask := gputypes.ColorWriteMaskAll
 	if desc.Fragment != nil && len(desc.Fragment.Targets) > 0 {
 		blend = desc.Fragment.Targets[0].Blend
+		colorWriteMask = desc.Fragment.Targets[0].WriteMask
 	}
 
 	return &RenderPipeline{
@@ -399,6 +410,7 @@ func (d *Device) CreateRenderPipeline(desc *RenderPipelineDescriptor) (hal.Rende
 		depthStencil:      desc.DepthStencil,
 		multisample:       desc.Multisample,
 		blend:             blend,
+		colorWriteMask:    colorWriteMask,
 	}, nil
 }
 
@@ -487,8 +499,9 @@ func (d *Device) DestroyQuerySet(_ hal.QuerySet) {
 // CreateCommandEncoder creates a command encoder.
 func (d *Device) CreateCommandEncoder(_ *CommandEncoderDescriptor) (hal.CommandEncoder, error) {
 	return &CommandEncoder{
-		glCtx: d.glCtx,
-		vao:   d.vao,
+		glCtx:           d.glCtx,
+		vao:             d.vao,
+		maxTextureUnits: d.maxTextureUnits,
 	}, nil
 }
 

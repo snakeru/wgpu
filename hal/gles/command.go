@@ -6,6 +6,7 @@
 package gles
 
 import (
+	"log/slog"
 	"unsafe"
 
 	"github.com/gogpu/gputypes"
@@ -31,10 +32,11 @@ func (c *CommandBuffer) Destroy() {
 // CommandEncoder implements hal.CommandEncoder for OpenGL.
 // Platform-specific fields are defined in command_<platform>.go files.
 type CommandEncoder struct {
-	glCtx    *gl.Context
-	commands []Command
-	label    string
-	vao      uint32 // persistent VAO from Device for Core Profile
+	glCtx           *gl.Context
+	commands        []Command
+	label           string
+	vao             uint32 // persistent VAO from Device for Core Profile
+	maxTextureUnits int32  // Hardware limit passed from Device
 }
 
 // BeginEncoding begins command recording.
@@ -213,7 +215,7 @@ func (e *CommandEncoder) setupColorAttachment(desc *hal.RenderPassDescriptor, rp
 	}
 
 	if tv.isSurface {
-		e.setupSurfaceTarget(tv)
+		e.setupSurfaceTarget(tv, rpe)
 		return
 	}
 
@@ -225,10 +227,11 @@ func (e *CommandEncoder) setupColorAttachment(desc *hal.RenderPassDescriptor, rp
 }
 
 // setupSurfaceTarget binds the default framebuffer and sets viewport to surface dimensions.
-func (e *CommandEncoder) setupSurfaceTarget(tv *TextureView) {
+func (e *CommandEncoder) setupSurfaceTarget(tv *TextureView, rpe *RenderPassEncoder) {
 	e.commands = append(e.commands, &BindFramebufferCommand{fbo: 0})
 	if tv.surfaceTex != nil && tv.surfaceTex.surface.config != nil {
 		cfg := tv.surfaceTex.surface.config
+		rpe.fbHeight = cfg.Height
 		e.commands = append(e.commands, &SetViewportCommand{
 			width:  float32(cfg.Width),
 			height: float32(cfg.Height),
@@ -255,6 +258,7 @@ func (e *CommandEncoder) setupOffscreenTarget(
 		}
 	}
 
+	rpe.fbHeight = tv.texture.size.Height
 	e.commands = append(e.commands, &SetViewportCommand{
 		width:  float32(tv.texture.size.Width),
 		height: float32(tv.texture.size.Height),
@@ -288,6 +292,7 @@ type RenderPassEncoder struct {
 	indexBuffer   *Buffer
 	indexFormat   gputypes.IndexFormat
 	stencilRef    uint32
+	fbHeight      uint32 // Framebuffer height for glScissor Y-coordinate flip
 
 	// MSAA resolve state: set during BeginRenderPass when ResolveTarget is present.
 	msaaTexture      *Texture // The MSAA color texture (source for resolve)
@@ -359,9 +364,10 @@ func (e *RenderPassEncoder) SetBindGroup(index uint32, group hal.BindGroup, offs
 		return
 	}
 	e.encoder.commands = append(e.encoder.commands, &SetBindGroupCommand{
-		index:          index,
-		group:          bg,
-		dynamicOffsets: offsets,
+		index:           index,
+		group:           bg,
+		dynamicOffsets:  offsets,
+		maxTextureUnits: e.encoder.maxTextureUnits,
 	})
 }
 
@@ -420,9 +426,12 @@ func (e *RenderPassEncoder) SetViewport(x, y, width, height, minDepth, maxDepth 
 }
 
 // SetScissorRect sets the scissor rectangle.
+// WebGPU uses top-left origin; OpenGL uses bottom-left origin.
+// The Y coordinate is flipped using the framebuffer height captured at BeginRenderPass.
 func (e *RenderPassEncoder) SetScissorRect(x, y, width, height uint32) {
 	e.encoder.commands = append(e.encoder.commands, &SetScissorCommand{
 		x: x, y: y, width: width, height: height,
+		fbHeight: e.fbHeight,
 	})
 }
 
@@ -523,9 +532,10 @@ func (e *ComputePassEncoder) SetBindGroup(index uint32, group hal.BindGroup, off
 		return
 	}
 	e.encoder.commands = append(e.encoder.commands, &SetBindGroupCommand{
-		index:          index,
-		group:          bg,
-		dynamicOffsets: offsets,
+		index:           index,
+		group:           bg,
+		dynamicOffsets:  offsets,
+		maxTextureUnits: e.encoder.maxTextureUnits,
 	})
 }
 
@@ -835,9 +845,10 @@ func (c *SetPipelineStateCommand) applyDepthStencilState(ctx *gl.Context) {
 
 // SetBindGroupCommand binds resources.
 type SetBindGroupCommand struct {
-	index          uint32
-	group          *BindGroup
-	dynamicOffsets []uint32
+	index           uint32
+	group           *BindGroup
+	dynamicOffsets  []uint32
+	maxTextureUnits int32 // Hardware limit for validation
 }
 
 func (c *SetBindGroupCommand) Execute(ctx *gl.Context) {
@@ -888,11 +899,32 @@ func (c *SetBindGroupCommand) Execute(ctx *gl.Context) {
 			if texID == 0 {
 				continue
 			}
+			// Validate texture unit index against hardware limit.
+			// Without this check, textures silently fail to bind when
+			// glBinding >= GL_MAX_TEXTURE_IMAGE_UNITS (typically 8 on Intel).
+			if c.maxTextureUnits > 0 && int32(glBinding) >= c.maxTextureUnits {
+				if l := hal.Logger(); l != nil {
+					l.Warn("GLES texture unit overflow: binding exceeds hardware limit",
+						slog.Uint64("glBinding", uint64(glBinding)),
+						slog.Int64("maxTextureUnits", int64(c.maxTextureUnits)),
+						slog.Uint64("group", uint64(c.index)),
+						slog.Uint64("binding", uint64(entry.Binding)),
+					)
+				}
+				continue
+			}
 			ctx.ActiveTexture(gl.TEXTURE0 + glBinding)
 			ctx.BindTexture(gl.TEXTURE_2D, texID)
 
 		case gputypes.SamplerBinding:
-			// GLES uses texture-bound sampler state, no GL sampler objects.
+			// Sampler handle is the GL sampler object ID (from NativeHandle()).
+			samplerID := uint32(res.Sampler)
+			if samplerID != 0 {
+				// Bind the GL sampler object to the texture unit corresponding
+				// to this binding index. The sampler overrides any texture-bound
+				// filtering/wrapping state on this unit.
+				ctx.BindSampler(glBinding, samplerID)
+			}
 		}
 	}
 }
@@ -947,13 +979,23 @@ func (c *SetViewportCommand) Execute(ctx *gl.Context) {
 }
 
 // SetScissorCommand sets the scissor rectangle.
+// It converts from WebGPU top-left origin to OpenGL bottom-left origin
+// using the framebuffer height: glY = fbHeight - y - height.
 type SetScissorCommand struct {
 	x, y, width, height uint32
+	fbHeight            uint32 // Framebuffer height for Y-coordinate flip
 }
 
 func (c *SetScissorCommand) Execute(ctx *gl.Context) {
 	ctx.Enable(gl.SCISSOR_TEST)
-	ctx.Scissor(int32(c.x), int32(c.y), int32(c.width), int32(c.height))
+	// OpenGL scissor uses bottom-left origin, WebGPU uses top-left origin.
+	// Convert: glY = fbHeight - y - height
+	// Clamp to 0 to avoid GL_INVALID_VALUE when fbHeight is 0 (uninitialized).
+	glY := int32(c.fbHeight) - int32(c.y) - int32(c.height)
+	if glY < 0 {
+		glY = 0
+	}
+	ctx.Scissor(int32(c.x), glY, int32(c.width), int32(c.height))
 }
 
 // SetBlendConstantCommand sets blend constant.
