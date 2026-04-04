@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/gogpu/gputypes"
+	"github.com/gogpu/wgpu/core"
 	"github.com/gogpu/wgpu/hal"
 )
 
@@ -13,6 +14,11 @@ type Queue struct {
 	halDevice hal.Device
 	device    *Device
 	pending   *pendingWrites
+
+	// lastSubmissionIndex is the most recent submission index returned by
+	// hal.Queue.Submit(). Used by DestroyQueue to conservatively defer
+	// resource destruction until after the latest known submission completes.
+	lastSubmissionIndex uint64
 }
 
 // Submit submits command buffers for execution. Non-blocking.
@@ -63,25 +69,22 @@ func (q *Queue) Submit(commandBuffers ...*CommandBuffer) (uint64, error) {
 		return 0, fmt.Errorf("wgpu: submit failed: %w", err)
 	}
 
+	// Track the latest submission index for deferred resource destruction.
+	q.lastSubmissionIndex = subIdx
+
 	// Record inflight resources and clean up completed ones.
 	// dstTextures/dstBuffers prevent premature Release (BUG-DX12-006: use-after-free).
-	// deferredBindGroups/deferredTextureViews prevent descriptor heap use-after-free
-	// by deferring HAL destroy until GPU completes this submission (BUG-DX12-007).
 	if q.pending != nil {
 		q.pending.mu.Lock()
-		deferredBG, deferredTV := q.pending.drainDeferred()
-		hasInflightWork := pendingCmdBuf != nil ||
-			flushedDstTextures != nil || deferredBG != nil || deferredTV != nil
+		hasInflightWork := pendingCmdBuf != nil || flushedDstTextures != nil
 		if hasInflightWork {
 			q.pending.inflight = append(q.pending.inflight, inflightSubmission{
-				submissionIndex:      subIdx,
-				staging:              nil, // staging managed by belt
-				cmdBuf:               pendingCmdBuf,
-				encoder:              flushedEncoder,
-				dstTextures:          flushedDstTextures,
-				dstBuffers:           flushedDstBuffers,
-				deferredBindGroups:   deferredBG,
-				deferredTextureViews: deferredTV,
+				submissionIndex: subIdx,
+				staging:         nil, // staging managed by belt
+				cmdBuf:          pendingCmdBuf,
+				encoder:         flushedEncoder,
+				dstTextures:     flushedDstTextures,
+				dstBuffers:      flushedDstBuffers,
 			})
 		}
 		// Update the staging belt with the actual submission index
@@ -91,6 +94,27 @@ func (q *Queue) Submit(commandBuffers ...*CommandBuffer) (uint64, error) {
 		}
 		q.pending.maintain(q.hal.PollCompleted())
 		q.pending.mu.Unlock()
+	}
+
+	// Collect tracked refs from command buffers and associate with this submission.
+	// Phase 2: per-command-buffer resource tracking — refs are Drop'd when GPU completes.
+	if dq := q.destroyQueue(); dq != nil {
+		var allRefs []*core.ResourceRef
+		for _, cb := range commandBuffers {
+			if cb != nil && len(cb.trackedRefs) > 0 {
+				allRefs = append(allRefs, cb.trackedRefs...)
+				cb.trackedRefs = nil
+			}
+		}
+		if len(allRefs) > 0 {
+			dq.TrackSubmission(subIdx, allRefs)
+		}
+	}
+
+	// Triage deferred resource destructions from the DestroyQueue.
+	// Resources whose GPU submissions have completed are now safe to destroy.
+	if dq := q.destroyQueue(); dq != nil {
+		dq.Triage(q.hal.PollCompleted())
 	}
 
 	return subIdx, nil
@@ -184,6 +208,20 @@ func (q *Queue) WriteTexture(dst *ImageCopyTexture, data []byte, layout *ImageDa
 	}
 
 	return q.hal.WriteTexture(halDst, data, &halLayout, &halSize)
+}
+
+// LastSubmissionIndex returns the most recent submission index.
+// Used by resource Release() methods to schedule deferred destruction.
+func (q *Queue) LastSubmissionIndex() uint64 {
+	return q.lastSubmissionIndex
+}
+
+// destroyQueue returns the device's DestroyQueue, or nil if unavailable.
+func (q *Queue) destroyQueue() *core.DestroyQueue {
+	if q.device != nil && q.device.core != nil {
+		return q.device.core.DestroyQueueRef()
+	}
+	return nil
 }
 
 // release cleans up queue resources.

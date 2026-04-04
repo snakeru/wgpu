@@ -56,6 +56,11 @@ func (d *Device) CreateBuffer(desc *BufferDescriptor) (*Buffer, error) {
 		return nil, err
 	}
 
+	// Phase 2: initialize ResourceRef for per-command-buffer tracking.
+	// onZero is nil — destruction is handled by Phase 1's DestroyQueue.Defer().
+	// The Ref tracks in-flight usage: Clone'd on encoding, Drop'd on GPU completion.
+	coreBuffer.Ref = core.NewResourceRef("Buffer:"+desc.Label, nil)
+
 	return &Buffer{core: coreBuffer, device: d}, nil
 }
 
@@ -310,7 +315,12 @@ func (d *Device) CreateBindGroup(desc *BindGroupDescriptor) (*BindGroup, error) 
 		return nil, fmt.Errorf("wgpu: failed to create bind group: %w", err)
 	}
 
-	return &BindGroup{hal: halGroup, device: d, layout: desc.Layout}, nil
+	return &BindGroup{
+		hal:    halGroup,
+		device: d,
+		layout: desc.Layout,
+		ref:    core.NewResourceRef("BindGroup:"+desc.Label, nil),
+	}, nil
 }
 
 // CreateRenderPipeline creates a render pipeline.
@@ -365,6 +375,7 @@ func (d *Device) CreateRenderPipeline(desc *RenderPipelineDescriptor) (*RenderPi
 		bindGroupLayouts:      bgLayouts,
 		requiredVertexBuffers: uint32(len(desc.Vertex.Buffers)), //nolint:gosec // buffer count fits uint32
 		blendConstantRequired: needsBlendConstant,
+		ref:                   core.NewResourceRef("RenderPipeline:"+desc.Label, nil),
 	}, nil
 }
 
@@ -404,6 +415,7 @@ func (d *Device) CreateComputePipeline(desc *ComputePipelineDescriptor) (*Comput
 		device:           d,
 		bindGroupCount:   bgCount,
 		bindGroupLayouts: bgLayouts,
+		ref:              core.NewResourceRef("ComputePipeline:"+desc.Label, nil),
 	}, nil
 }
 
@@ -545,6 +557,7 @@ func (d *Device) WaitIdle() error {
 }
 
 // Release releases the device and all associated resources.
+// Deferred resource destructions are flushed before the device is destroyed.
 func (d *Device) Release() {
 	if d.released {
 		return
@@ -555,7 +568,26 @@ func (d *Device) Release() {
 		d.queue.release()
 	}
 
+	// core.Device.Destroy() calls DestroyQueue.FlushAll() internally.
 	d.core.Destroy()
+}
+
+// destroyQueue returns the device's DestroyQueue for deferred resource destruction.
+// Returns nil if the device has no HAL integration or no DestroyQueue.
+func (d *Device) destroyQueue() *core.DestroyQueue {
+	if d.core == nil {
+		return nil
+	}
+	return d.core.DestroyQueueRef()
+}
+
+// lastSubmissionIndex returns the latest submission index from the queue.
+// Used by Release() methods to schedule deferred destruction.
+func (d *Device) lastSubmissionIndex() uint64 {
+	if d.queue == nil {
+		return 0
+	}
+	return d.queue.LastSubmissionIndex()
 }
 
 // halDevice returns the underlying HAL device for direct resource creation.

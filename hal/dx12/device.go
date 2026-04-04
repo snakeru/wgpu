@@ -88,6 +88,11 @@ type Device struct {
 	frameIndex     uint64
 	freeAllocators []*d3d12.ID3D12CommandAllocator
 	allocatorMu    sync.Mutex
+
+	// In-memory HLSL->DXBC shader cache (TASK-DX12-PSO-CACHE-001).
+	// Caches FXC compilation results keyed by HLSL source hash + entry point + stage + target.
+	// Matches Rust wgpu ShaderCache pattern (wgpu-hal/src/dx12/mod.rs:1136).
+	shaderCache ShaderCache
 }
 
 // DescriptorHeap wraps a D3D12 descriptor heap with allocation tracking.
@@ -555,6 +560,7 @@ func (d *Device) checkHealth(operation string) error {
 	d.DrainDebugMessages()
 	if reason := d.raw.GetDeviceRemovedReason(); reason != nil {
 		hal.Logger().Error("dx12: device removed", "step", d.debugStep, "operation", operation, "reason", reason)
+		d.logDREDBreadcrumbs()
 		return fmt.Errorf("dx12: device removed at step %d (%s): %w", d.debugStep, operation, reason)
 	}
 	return nil
@@ -564,6 +570,162 @@ func (d *Device) checkHealth(operation string) error {
 // is still operational. Returns nil if healthy, or an error with the removal reason.
 func (d *Device) CheckHealth(label string) error {
 	return d.checkHealth(label)
+}
+
+// logDREDBreadcrumbs queries and logs DRED (Device Removed Extended Data) after
+// a device removal event. This provides auto-breadcrumbs showing which GPU command
+// was executing when the TDR occurred, and page fault information if applicable.
+// No-op if DRED is not available or was not enabled.
+func (d *Device) logDREDBreadcrumbs() {
+	dred := d.raw.QueryDRED1()
+	if dred == nil {
+		hal.Logger().Debug("dx12: DRED not available for this device")
+		return
+	}
+	defer dred.Release()
+
+	// Query auto-breadcrumbs
+	var breadcrumbs d3d12.D3D12DREDAutoBreadcrumbsOutput1
+	if err := dred.GetAutoBreadcrumbsOutput1(&breadcrumbs); err != nil {
+		hal.Logger().Warn("dx12: DRED GetAutoBreadcrumbsOutput1 failed", "err", err)
+	} else {
+		d.logBreadcrumbNodes(breadcrumbs.HeadAutoBreadcrumbNode)
+	}
+
+	// Query page fault information
+	var pageFault d3d12.D3D12DREDPageFaultOutput1
+	if err := dred.GetPageFaultAllocationOutput1(&pageFault); err != nil {
+		hal.Logger().Warn("dx12: DRED GetPageFaultAllocationOutput1 failed", "err", err)
+	} else {
+		d.logPageFault(&pageFault)
+	}
+}
+
+// logBreadcrumbNodes walks the DRED breadcrumb linked list and logs each node.
+func (d *Device) logBreadcrumbNodes(node *d3d12.D3D12AutoBreadcrumbNode1) {
+	if node == nil {
+		hal.Logger().Info("dx12: DRED — no breadcrumb data available")
+		return
+	}
+
+	const dredUnnamed = "<unnamed>"
+
+	nodeIdx := 0
+	for n := node; n != nil; n = n.Next {
+		ops := n.BreadcrumbOps()
+		lastCompleted := n.LastCompleted()
+
+		// Read debug names (may be nil)
+		cmdListName := dredUnnamed
+		if n.CommandListDebugNameW != nil {
+			if name := windows.UTF16PtrToString(n.CommandListDebugNameW); name != "" {
+				cmdListName = name
+			}
+		}
+		cmdQueueName := dredUnnamed
+		if n.CommandQueueDebugNameW != nil {
+			if name := windows.UTF16PtrToString(n.CommandQueueDebugNameW); name != "" {
+				cmdQueueName = name
+			}
+		}
+
+		hal.Logger().Error("dx12: DRED breadcrumb node",
+			"node", nodeIdx,
+			"commandList", cmdListName,
+			"commandQueue", cmdQueueName,
+			"totalOps", len(ops),
+			"lastCompleted", lastCompleted,
+		)
+
+		// Log operations around the hang point (context window)
+		if len(ops) > 0 {
+			d.logBreadcrumbOps(ops, lastCompleted)
+		}
+
+		nodeIdx++
+	}
+}
+
+// logBreadcrumbOps logs the operations around the last completed breadcrumb,
+// showing which operation was executing when the GPU hung.
+func (d *Device) logBreadcrumbOps(ops []d3d12.D3D12AutoBreadcrumbOp, lastCompleted uint32) {
+	// Show a window around the hang point: 3 before + the hung op + 2 after
+	const contextBefore = 3
+	const contextAfter = 2
+
+	start := int(lastCompleted) - contextBefore
+	if start < 0 {
+		start = 0
+	}
+	end := int(lastCompleted) + contextAfter + 2 // +2 for the hung op and one extra
+	if end > len(ops) {
+		end = len(ops)
+	}
+
+	for i := start; i < end; i++ {
+		opName := d3d12.AutoBreadcrumbOpName(ops[i])
+		status := "COMPLETED"
+		marker := ""
+
+		switch {
+		case uint32(i) == lastCompleted:
+			marker = " <- last completed"
+		case uint32(i) == lastCompleted+1:
+			status = "INCOMPLETE"
+			marker = " <- GPU hung here"
+		case uint32(i) > lastCompleted:
+			status = "not reached"
+		}
+
+		hal.Logger().Error("dx12: DRED op",
+			"index", i,
+			"op", opName,
+			"status", status+marker,
+		)
+	}
+}
+
+// logPageFault logs DRED page fault information.
+func (d *Device) logPageFault(pf *d3d12.D3D12DREDPageFaultOutput1) {
+	if pf.PageFaultVA == 0 && pf.HeadExistingAllocationNode == nil && pf.HeadRecentFreedAllocationNode == nil {
+		hal.Logger().Info("dx12: DRED — no page fault detected")
+		return
+	}
+
+	hal.Logger().Error("dx12: DRED page fault",
+		"faultAddress", fmt.Sprintf("0x%016X", pf.PageFaultVA),
+	)
+
+	// Log existing allocations near the fault
+	if pf.HeadExistingAllocationNode != nil {
+		hal.Logger().Error("dx12: DRED — existing allocations at fault address:")
+		d.logAllocationNodes(pf.HeadExistingAllocationNode, 5)
+	}
+
+	// Log recently freed allocations (use-after-free detection)
+	if pf.HeadRecentFreedAllocationNode != nil {
+		hal.Logger().Error("dx12: DRED — recently freed allocations (possible use-after-free):")
+		d.logAllocationNodes(pf.HeadRecentFreedAllocationNode, 5)
+	}
+}
+
+// logAllocationNodes logs up to maxNodes allocation nodes from a DRED linked list.
+func (d *Device) logAllocationNodes(node *d3d12.D3D12DREDAllocationNode1, maxNodes int) {
+	const unnamed = "<unnamed>"
+	count := 0
+	for n := node; n != nil && count < maxNodes; n = n.Next {
+		name := unnamed
+		if n.ObjectNameW != nil {
+			if wname := windows.UTF16PtrToString(n.ObjectNameW); wname != "" {
+				name = wname
+			}
+		}
+		hal.Logger().Error("dx12: DRED allocation",
+			"name", name,
+			"type", n.AllocationType,
+		)
+		count++
+	}
 }
 
 // DrainDebugMessages reads and logs all pending messages from the D3D12 InfoQueue.
@@ -846,6 +1008,7 @@ func (d *Device) CreateTexture(desc *hal.TextureDescriptor) (hal.Texture, error)
 	// Check device health before allocating resources.
 	if reason := d.raw.GetDeviceRemovedReason(); reason != nil {
 		d.DrainDebugMessages() // Print validation errors that killed the device
+		d.logDREDBreadcrumbs()
 		return nil, fmt.Errorf("dx12: device already removed before CreateTexture (format=%d, samples=%d): %w",
 			desc.Format, desc.SampleCount, reason)
 	}
@@ -980,6 +1143,7 @@ func (d *Device) CreateTexture(desc *hal.TextureDescriptor) (hal.Texture, error)
 	// Post-creation health check: detect if CreateCommittedResource silently poisoned the device.
 	if reason := d.raw.GetDeviceRemovedReason(); reason != nil {
 		d.DrainDebugMessages()
+		d.logDREDBreadcrumbs()
 		hal.Logger().Error("dx12: device removed during CreateTexture",
 			"label", desc.Label,
 			"format", createFormat, "samples", sampleCount,
@@ -1693,13 +1857,12 @@ func (d *Device) compileWGSLModule(wgslSource string, nagaOpts *hlsl.Options, mo
 		"entryPoints", len(irModule.EntryPoints),
 	)
 
-	// Step 5: Load d3dcompiler_47.dll
-	compiler, err := d3dcompile.Load()
-	if err != nil {
-		return fmt.Errorf("load d3dcompiler: %w", err)
-	}
+	// Step 5: Load d3dcompiler_47.dll (deferred until cache miss)
+	var compiler *d3dcompile.Lib
 
-	// Step 6: Compile each entry point separately
+	// Step 6: Compile each entry point separately, using shader cache.
+	// Cache key = SHA-256(HLSL source) + entry point + stage + target.
+	// This matches Rust wgpu's ShaderCache pattern (device.rs:390-428).
 	for i := range irModule.EntryPoints {
 		ep := &irModule.EntryPoints[i]
 		target := shaderStageToTarget(ep.Stage)
@@ -1712,12 +1875,29 @@ func (d *Device) compileWGSLModule(wgslSource string, nagaOpts *hlsl.Options, mo
 			}
 		}
 
+		// Check shader cache before calling FXC.
+		cacheKey := NewShaderCacheKey(hlslSource, hlslName, ep.Stage, target)
+		if cached, ok := d.shaderCache.Get(cacheKey); ok {
+			module.entryPoints[ep.Name] = cached
+			continue
+		}
+
+		// Cache miss — load compiler if not yet loaded and compile via FXC.
+		if compiler == nil {
+			compiler, err = d3dcompile.Load()
+			if err != nil {
+				return fmt.Errorf("load d3dcompiler: %w", err)
+			}
+		}
+
 		bytecode, err := compiler.Compile(hlslSource, hlslName, target)
 		if err != nil {
 			return fmt.Errorf("D3DCompile entry point %q (hlsl: %q, target: %s): %w",
 				ep.Name, hlslName, target, err)
 		}
 
+		// Store in cache for future pipelines using the same shader.
+		d.shaderCache.Put(cacheKey, bytecode)
 		module.entryPoints[ep.Name] = bytecode
 	}
 
@@ -1803,6 +1983,7 @@ func (d *Device) CreateRenderPipeline(desc *hal.RenderPipelineDescriptor) (hal.R
 	d.DrainDebugMessages() // Check for validation warnings/errors during PSO creation
 	if err != nil {
 		if reason := d.raw.GetDeviceRemovedReason(); reason != nil {
+			d.logDREDBreadcrumbs()
 			return nil, fmt.Errorf("dx12: CreateGraphicsPipelineState failed (device removed: %w): %w", reason, err)
 		}
 		return nil, fmt.Errorf("dx12: CreateGraphicsPipelineState failed: %w", err)
@@ -1918,6 +2099,7 @@ func (d *Device) CreateComputePipeline(desc *hal.ComputePipelineDescriptor) (hal
 	d.DrainDebugMessages() // Check for validation warnings/errors during PSO creation
 	if err != nil {
 		if reason := d.raw.GetDeviceRemovedReason(); reason != nil {
+			d.logDREDBreadcrumbs()
 			return nil, fmt.Errorf("dx12: CreateComputePipelineState failed (device removed: %w): %w", reason, err)
 		}
 		return nil, fmt.Errorf("dx12: CreateComputePipelineState failed: %w", err)

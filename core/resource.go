@@ -89,6 +89,13 @@ type Device struct {
 	// This is nil for devices created via the ID-based API without HAL.
 	trackerIndices *TrackerIndexAllocators
 
+	// destroyQueue defers HAL resource destruction until the GPU completes
+	// the submission that was active when the resource was released.
+	// This prevents use-after-free on DX12/Vulkan when a resource is
+	// released while the GPU is still referencing it (BUG-DX12-TDR).
+	// Matches Rust wgpu-core's LifetimeTracker pattern.
+	destroyQueue *DestroyQueue
+
 	// === Common fields ===
 
 	// Label is a debug label for the device.
@@ -136,6 +143,7 @@ func NewDevice(
 		adapter:        adapter,
 		snatchLock:     NewSnatchLock(),
 		trackerIndices: NewTrackerIndexAllocators(),
+		destroyQueue:   NewDestroyQueue(),
 		Label:          label,
 		Features:       features,
 		Limits:         limits,
@@ -201,6 +209,13 @@ func (d *Device) Destroy() {
 
 	untrackResource(uintptr(unsafe.Pointer(d))) //nolint:gosec // debug tracking uses pointer as unique ID
 
+	// Flush all deferred resource destructions before destroying the device.
+	// At this point the GPU should be idle (caller should have called WaitIdle
+	// or equivalent), so all deferred destroys are safe to execute.
+	if d.destroyQueue != nil {
+		d.destroyQueue.FlushAll()
+	}
+
 	if d.snatchLock == nil || d.raw == nil {
 		return
 	}
@@ -241,6 +256,15 @@ func (d *Device) HasHAL() bool {
 // Returns nil if the device has no HAL integration.
 func (d *Device) TrackerIndices() *TrackerIndexAllocators {
 	return d.trackerIndices
+}
+
+// DestroyQueueRef returns the device's deferred destruction queue.
+// Resources scheduled via Defer() will be destroyed when Triage() confirms
+// their associated GPU submission has completed.
+//
+// Returns nil if the device has no HAL integration.
+func (d *Device) DestroyQueueRef() *DestroyQueue {
+	return d.destroyQueue
 }
 
 // ParentAdapter returns the parent adapter for this device.
@@ -424,6 +448,12 @@ type Buffer struct {
 
 	// trackingData holds per-resource tracking information.
 	trackingData *TrackingData
+
+	// Ref is the GPU-aware reference counter for this buffer (Phase 2).
+	// When a command encoder uses this buffer, it Clone()'s the Ref.
+	// When the GPU completes the submission, the clone is Drop()'d.
+	// This keeps the resource alive exactly as long as needed.
+	Ref *ResourceRef
 }
 
 // BufferMapState represents the current mapping state of a buffer.
@@ -732,6 +762,9 @@ type Texture struct {
 
 	// trackingData holds per-resource tracking information.
 	trackingData *TrackingData
+
+	// Ref is the GPU-aware reference counter for this texture (Phase 2).
+	Ref *ResourceRef
 }
 
 // NewTexture creates a core Texture wrapping a HAL texture.
@@ -808,6 +841,9 @@ type Sampler struct {
 
 	// trackingData holds per-resource tracking information.
 	trackingData *TrackingData
+
+	// Ref is the GPU-aware reference counter for this sampler (Phase 2).
+	Ref *ResourceRef
 }
 
 // NewSampler creates a core Sampler wrapping a HAL sampler.
@@ -861,6 +897,9 @@ type BindGroupLayout struct {
 
 	// trackingData holds per-resource tracking information.
 	trackingData *TrackingData
+
+	// Ref is the GPU-aware reference counter for this bind group layout (Phase 2).
+	Ref *ResourceRef
 }
 
 // NewBindGroupLayout creates a core BindGroupLayout wrapping a HAL bind group layout.
@@ -919,6 +958,9 @@ type PipelineLayout struct {
 
 	// trackingData holds per-resource tracking information.
 	trackingData *TrackingData
+
+	// Ref is the GPU-aware reference counter for this pipeline layout (Phase 2).
+	Ref *ResourceRef
 }
 
 // NewPipelineLayout creates a core PipelineLayout wrapping a HAL pipeline layout.
@@ -973,6 +1015,9 @@ type BindGroup struct {
 
 	// trackingData holds per-resource tracking information.
 	trackingData *TrackingData
+
+	// Ref is the GPU-aware reference counter for this bind group (Phase 2).
+	Ref *ResourceRef
 }
 
 // NewBindGroup creates a core BindGroup wrapping a HAL bind group.
@@ -1023,6 +1068,9 @@ type ShaderModule struct {
 
 	// trackingData holds per-resource tracking information.
 	trackingData *TrackingData
+
+	// Ref is the GPU-aware reference counter for this shader module (Phase 2).
+	Ref *ResourceRef
 }
 
 // NewShaderModule creates a core ShaderModule wrapping a HAL shader module.
@@ -1073,6 +1121,9 @@ type RenderPipeline struct {
 
 	// trackingData holds per-resource tracking information.
 	trackingData *TrackingData
+
+	// Ref is the GPU-aware reference counter for this render pipeline (Phase 2).
+	Ref *ResourceRef
 }
 
 // NewRenderPipeline creates a core RenderPipeline wrapping a HAL render pipeline.
@@ -1123,6 +1174,9 @@ type ComputePipeline struct {
 
 	// trackingData holds per-resource tracking information.
 	trackingData *TrackingData
+
+	// Ref is the GPU-aware reference counter for this compute pipeline (Phase 2).
+	Ref *ResourceRef
 }
 
 // NewComputePipeline creates a core ComputePipeline wrapping a HAL compute pipeline.
@@ -1348,6 +1402,9 @@ type QuerySet struct {
 
 	// trackingData holds per-resource tracking information.
 	trackingData *TrackingData
+
+	// Ref is the GPU-aware reference counter for this query set (Phase 2).
+	Ref *ResourceRef
 }
 
 // NewQuerySet creates a core QuerySet wrapping a HAL query set.

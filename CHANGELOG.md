@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.6] - 2026-04-04
+
+### Added
+
+#### Core
+
+- **Deferred resource destruction (ResourceRef + DestroyQueue)** — All GPU
+  resources (Buffer, Texture, TextureView, BindGroup, Pipeline, Sampler, etc.)
+  now defer HAL destruction until the GPU completes the submission that was active
+  when `Release()` was called. Prevents use-after-free crashes on DX12 (TDR) and
+  validation errors on Vulkan when resources are released while the GPU is still
+  rendering with them. Implements Go equivalent of Rust wgpu-core's
+  `LifetimeTracker` pattern with `ResourceRef` (atomic refcount, Go analog of
+  Rust `Arc`) and `DestroyQueue` (submission-scoped triage).
+  (TASK-WGPU-CORE-LIFETIME-001)
+
+- **Per-command-buffer resource tracking** — Command encoders now Clone()
+  ResourceRef for every resource bound during render/compute pass encoding
+  (SetVertexBuffer, SetBindGroup, SetPipeline, etc.). Refs transfer through
+  `End()` → `Finish()` → `Submit()` → `DestroyQueue.TrackSubmission()` and are
+  Drop()'d when GPU completes the submission. Matches Rust wgpu-core
+  `EncoderInFlight` pattern where `Arc` refs in trackers keep resources alive.
+  (TASK-WGPU-CORE-LIFETIME-002)
+
+- **Unified destruction mechanism** — Migrated TextureView and BindGroup from
+  duplicate `pendingWrites` deferred mechanism to `core.DestroyQueue`. All 9
+  resource types now use a single destruction path. Removed 234 lines of
+  duplicate code. (TASK-WGPU-CORE-LIFETIME-003)
+
+#### DX12
+
+- **In-memory HLSL→DXBC shader cache** — Caches FXC compilation results keyed
+  by SHA-256(HLSL source) + entry point + stage + target profile. 30 pipelines
+  sharing 8 unique shaders → 8 FXC calls instead of 30. LRU eviction at 200
+  entries retaining last 100. Matches Rust wgpu ShaderCache pattern
+  (wgpu-hal/src/dx12/mod.rs:1136). Fixes DEVICE_HUNG on first frame for complex
+  UI (Gallery with 15-30 PSOs). (TASK-DX12-PSO-CACHE-001)
+
+- **DRED diagnostics (Device Removed Extended Data)** — When DX12 debug mode is
+  enabled (`InstanceFlagsDebug`), auto-breadcrumbs and page fault tracking are
+  activated. On TDR/device removal, logs which GPU command was executing
+  (breadcrumb context window around hang point) and which allocation was accessed
+  (use-after-free detection via recently freed allocations list). Provides
+  enterprise-level GPU crash diagnostics not available in Rust wgpu.
+  (TASK-DX12-DRED-001)
+
+### Fixed
+
+#### Core
+
+- **Deferred resource destruction — use-after-free fix** — `Buffer.Release()`,
+  `Texture.Release()`, and all other resource `Release()` methods were calling HAL
+  destroy immediately while the GPU was still using the resource. On DX12 this caused
+  TDR (DEVICE_HUNG) after ~300-700 frames in gallery app. Root cause: missing
+  LifetimeTracker after wgpu core API migration (v0.21.0). Now all 9 resource types
+  defer destruction via `core.DestroyQueue` until GPU completes the associated
+  submission. (TASK-WGPU-CORE-LIFETIME-001)
+
 ## [0.23.5] - 2026-04-04
 
 ### Fixed
