@@ -19,7 +19,7 @@
 
 ---
 
-## Current State: v0.23.6
+## Current State: v0.23.8
 
 ✅ **All 5 HAL backends complete** (~127K LOC)
 ✅ **Three-layer WebGPU stack** — wgpu API → wgpu/core → wgpu/hal
@@ -56,7 +56,7 @@
 ### Next: v0.25.0
 
 - [ ] DX12 DeviceTextureTracker for proper barrier state tracking
-- [ ] GLES BindingMap refactor → per-type sequential counters (Rust parity)
+- [x] GLES BindingMap refactor → per-type sequential counters (v0.23.8)
 - [ ] GLES global UNPACK_ALIGNMENT=1 (Rust pattern — set once at device open)
 - [ ] Vulkan relay semaphores for multi-submission ordering (VK-SYNC-001)
 
@@ -123,6 +123,8 @@
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| **v0.23.8** | 2026-04 | Metal vertex buffer fix, GLES per-type binding counters, StagingBelt alignment |
+| **v0.23.7** | 2026-04 | naga v0.16.4 (HLSL 72/72 parity, 330× faster FXC array init) |
 | **v0.23.6** | 2026-04 | Deferred resource destruction, DX12 shader cache, DRED diagnostics |
 | **v0.23.5** | 2026-04 | GLES coordinate space, Vulkan fence recycling, blend constant validation |
 | **v0.23.4** | 2026-04 | GLES text fix, DX12 TDR (descriptor UAF), StagingBelt |

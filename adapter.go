@@ -57,8 +57,17 @@ func (a *Adapter) requestDeviceHAL(desc *DeviceDescriptor) (*Device, error) {
 		features = desc.RequiredFeatures
 		limits = desc.RequiredLimits
 		label = desc.Label
-	} else {
-		limits = gputypes.DefaultLimits()
+	}
+
+	// If no limits specified (nil descriptor or zero-value RequiredLimits),
+	// use the adapter's actual hardware limits. This matches the WebGPU spec:
+	// "Each limit in the returned device will be no worse than the corresponding
+	// limit in adapter.limits." When user doesn't specify limits, device gets
+	// full hardware capabilities (e.g., Intel Iris Xe reports 200 storage buffers,
+	// not the WebGPU minimum of 8).
+	// Matches Rust wgpu which returns adapter limits by default.
+	if limits == (gputypes.Limits{}) {
+		limits = a.limits
 	}
 
 	openDevice, err := a.core.HALAdapter().Open(features, limits)

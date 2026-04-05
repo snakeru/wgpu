@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.8] - 2026-04-05
+
+### Fixed
+
+#### Metal
+
+- **Descending vertex buffer indices** — Metal vertex, uniform and storage buffers
+  share the same index range. Vertex buffers now use descending indices from the
+  end of the range (`maxVertexBuffers - 1 - slot`) to avoid collisions with
+  uniform/storage buffers assigned from the start. Matches Rust wgpu-hal pattern.
+  Contributed by @jdbann. (gogpu/gogpu#165)
+
+#### GLES
+
+- **Per-type sequential binding counters** — Replaced hardcoded `group*16+binding`
+  formula with per-type sequential counters (samplers, textures, images, uniform
+  buffers, storage buffers) computed at PipelineLayout creation. Fixes binding
+  collision when >16 bindings per group. Removed all `maxBindingsPerGroup=16`
+  constants. Matches Rust wgpu-hal `device.rs:1154-1221`. (GLES-001)
+
+- **StagingBelt configurable alignment** — Default alignment changed from 16 to 8
+  bytes (Rust wgpu `MAP_ALIGNMENT` parity). Alignment now configurable per-belt.
+  WebGPU `COPY_BUFFER_ALIGNMENT` is 4. (TASK-WGPU-BELT-002)
+
+#### Core
+
+- **Default limits when RequiredLimits is zero struct** — `RequestDevice()` with a
+  descriptor containing zero-value `RequiredLimits` caused all device limits to be 0,
+  rejecting all bind group layouts ("binding count N exceeds maximum 0"). Now detects
+  zero struct and falls back to WebGPU spec defaults. Matches Rust wgpu
+  `DeviceDescriptor::default()` behavior. (BUG-WGPU-LIMITS-001)
+
+- **PowerPreference fallback per WebGPU spec** — `RequestAdapter()` with
+  `PowerPreference: HighPerformance` on systems with only integrated GPU returned
+  error instead of falling back. WebGPU spec: powerPreference is a hint, "must not
+  cause requestAdapter() to fail if there is at least one available adapter."
+  Now uses two-pass selection: prefer matching, fall back to any GPU. Matches Rust
+  wgpu sort-not-filter approach. (BUG-WGPU-ADAPTER-002)
+
+- **Device inherits adapter limits instead of WebGPU defaults** — `RequestDevice()`
+  with empty `RequiredLimits` returned WebGPU spec minimums (e.g., 8 storage buffers)
+  instead of the adapter's actual capabilities (e.g., 200 on Intel Iris Xe). Blocked
+  gg Vello coarse shader (9 storage buffer bindings). Device now inherits adapter
+  limits when no explicit limits requested. (BUG-WGPU-LIMITS-002)
+
 ## [0.23.7] - 2026-04-04
 
 ### Changed
