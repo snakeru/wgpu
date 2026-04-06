@@ -18,6 +18,23 @@ type Device struct {
 	core     *core.Device
 	queue    *Queue
 	released bool
+
+	// cmdEncoderPool is the single shared encoder pool for the device.
+	// Used by both CreateCommandEncoder (user command encoders) and
+	// PendingWrites (internal staging encoders). Matches Rust wgpu-core's
+	// single device.command_allocator for both paths (queue.rs:1373).
+	//
+	// Encoders are acquired from the pool instead of creating expensive
+	// GPU resources (DX12 ID3D12CommandAllocator ~64KB, Vulkan VkCommandPool)
+	// every frame. After GPU completion, encoders are reset via ResetAll
+	// and returned to the pool for reuse.
+	//
+	// Lifecycle: created before PendingWrites, destroyed after PendingWrites.
+	// PendingWrites.destroy() clears its pool reference but does NOT destroy
+	// the pool. Device.Release() destroys the pool after all users are done.
+	//
+	// nil when no HAL device (e.g., core-only path).
+	cmdEncoderPool *encoderPool
 }
 
 // Queue returns the device's command queue.
@@ -420,6 +437,12 @@ func (d *Device) CreateComputePipeline(desc *ComputePipelineDescriptor) (*Comput
 }
 
 // CreateCommandEncoder creates a command encoder for recording GPU commands.
+//
+// When a device-level encoder pool is available (BUG-DX12-004), the HAL encoder
+// is acquired from the pool instead of creating a new one. This avoids allocating
+// expensive GPU resources (DX12 ID3D12CommandAllocator ~64KB, Vulkan VkCommandPool)
+// on every frame. After GPU completion, the encoder is reset and returned to the
+// pool for reuse. Matches Rust wgpu-core's CommandAllocator pattern (allocator.rs).
 func (d *Device) CreateCommandEncoder(desc *CommandEncoderDescriptor) (*CommandEncoder, error) {
 	if d.released {
 		return nil, ErrReleased
@@ -430,6 +453,34 @@ func (d *Device) CreateCommandEncoder(desc *CommandEncoderDescriptor) (*CommandE
 		label = desc.Label
 	}
 
+	// When pool is available, acquire a recycled HAL encoder and pass it to core.
+	// This bypasses core's internal CreateCommandEncoder which would create a new
+	// HAL encoder, and instead uses CreateCommandEncoderWithHAL that accepts
+	// a pre-existing encoder already in recording state.
+	if d.cmdEncoderPool != nil {
+		halEnc, err := d.cmdEncoderPool.acquire()
+		if err != nil {
+			return nil, fmt.Errorf("wgpu: encoder pool acquire: %w", err)
+		}
+
+		if err := halEnc.BeginEncoding(label); err != nil {
+			// Failed to begin encoding — return encoder to pool for future use.
+			d.cmdEncoderPool.release(halEnc)
+			return nil, fmt.Errorf("wgpu: begin encoding: %w", err)
+		}
+
+		coreEncoder, err := d.core.CreateCommandEncoderWithHAL(halEnc, label)
+		if err != nil {
+			halEnc.DiscardEncoding()
+			d.cmdEncoderPool.release(halEnc)
+			return nil, err
+		}
+
+		return &CommandEncoder{core: coreEncoder, device: d, halEncoder: halEnc}, nil
+	}
+
+	// Fallback: no pool available (e.g., non-HAL device). Use core's built-in
+	// encoder creation which creates a fresh HAL encoder each time.
 	coreEncoder, err := d.core.CreateCommandEncoder(label)
 	if err != nil {
 		return nil, err
@@ -558,6 +609,20 @@ func (d *Device) WaitIdle() error {
 
 // Release releases the device and all associated resources.
 // Deferred resource destructions are flushed before the device is destroyed.
+// Shutdown order:
+//  0. WaitIdle — block until ALL GPU submissions complete
+//  1. Triage + FlushAll — deferred callbacks fire (encoders return to pool)
+//  2. Destroy encoder pool (HAL device still alive)
+//  3. Destroy core + HAL device
+//
+// WaitIdle is required because FlushAll calls Triage(PollCompleted()),
+// but PollCompleted may return a stale index if GPU hasn't finished.
+// Without WaitIdle, deferred encoder recycling callbacks don't fire,
+// and pool.destroy() destroys encoders whose VkCommandPool is then
+// double-freed by hal.Device.Destroy() → vkDestroyCommandPool crash.
+//
+// Rust avoids this via Arc ownership + maintain loop. In Go we must
+// be explicit: WaitIdle ensures PollCompleted returns final index.
 func (d *Device) Release() {
 	if d.released {
 		return
@@ -568,7 +633,33 @@ func (d *Device) Release() {
 		d.queue.release()
 	}
 
-	// core.Device.Destroy() calls DestroyQueue.FlushAll() internally.
+	// Step 0: Wait for ALL GPU work to finish. This ensures PollCompleted()
+	// returns the final submission index, so Triage processes all submissions
+	// and deferred encoder recycling callbacks fire correctly.
+	_ = d.WaitIdle()
+
+	// Step 1: Flush deferred destructions. With GPU idle, Triage processes
+	// all submissions. Encoder recycling callbacks fire, returning encoders
+	// to cmdEncoderPool. HAL device is still alive.
+	if d.core != nil && d.core.DestroyQueueRef() != nil {
+		dq := d.core.DestroyQueueRef()
+		// Triage with latest completion index (GPU is idle, all done).
+		if d.queue != nil && d.queue.hal != nil {
+			dq.Triage(d.queue.hal.PollCompleted())
+		}
+		dq.FlushAll()
+	}
+
+	// Step 2: Destroy encoder pool. Each encoder.Destroy() calls
+	// vkDestroyCommandPool / ID3D12CommandAllocator.Release on the still-alive
+	// HAL device. After this, no native encoder resources remain.
+	if d.cmdEncoderPool != nil {
+		d.cmdEncoderPool.destroy()
+		d.cmdEncoderPool = nil
+	}
+
+	// Step 3: Destroy core + HAL device. core.Destroy() calls FlushAll again
+	// (idempotent — already flushed) then halDevice.Destroy().
 	d.core.Destroy()
 }
 

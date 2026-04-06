@@ -3,7 +3,6 @@ package wgpu
 import (
 	"fmt"
 
-	"github.com/gogpu/gputypes"
 	"github.com/gogpu/wgpu/core"
 	"github.com/gogpu/wgpu/hal"
 )
@@ -96,28 +95,61 @@ func (q *Queue) Submit(commandBuffers ...*CommandBuffer) (uint64, error) {
 		q.pending.mu.Unlock()
 	}
 
+	// Post-submit bookkeeping: track refs, recycle encoders, triage destroys.
+	q.postSubmit(subIdx, commandBuffers)
+
+	return subIdx, nil
+}
+
+// postSubmit handles bookkeeping after a successful HAL submit:
+// 1. Tracks Clone'd ResourceRefs for Drop on GPU completion (Phase 2)
+// 2. Schedules HAL encoder recycling via DestroyQueue (BUG-DX12-004)
+// 3. Triages deferred resource destructions
+func (q *Queue) postSubmit(subIdx uint64, commandBuffers []*CommandBuffer) {
+	dq := q.destroyQueue()
+	if dq == nil {
+		return
+	}
+
 	// Collect tracked refs from command buffers and associate with this submission.
 	// Phase 2: per-command-buffer resource tracking — refs are Drop'd when GPU completes.
-	if dq := q.destroyQueue(); dq != nil {
-		var allRefs []*core.ResourceRef
-		for _, cb := range commandBuffers {
-			if cb != nil && len(cb.trackedRefs) > 0 {
-				allRefs = append(allRefs, cb.trackedRefs...)
-				cb.trackedRefs = nil
-			}
+	var allRefs []*core.ResourceRef
+	for _, cb := range commandBuffers {
+		if cb != nil && len(cb.trackedRefs) > 0 {
+			allRefs = append(allRefs, cb.trackedRefs...)
+			cb.trackedRefs = nil
 		}
-		if len(allRefs) > 0 {
-			dq.TrackSubmission(subIdx, allRefs)
+	}
+	if len(allRefs) > 0 {
+		dq.TrackSubmission(subIdx, allRefs)
+	}
+
+	// Schedule HAL encoder recycling after GPU completion (BUG-DX12-004).
+	// Each command buffer carries the HAL encoder that produced it. After the
+	// GPU finishes this submission, the encoder is reset via ResetAll (which
+	// resets the DX12 ID3D12CommandAllocator or Vulkan VkCommandPool) and
+	// returned to the device's encoder pool for reuse.
+	//
+	// Matches Rust wgpu-core's CommandAllocator::release_encoder pattern where
+	// encoders travel: CommandEncoder -> CommandBuffer -> EncoderInFlight -> pool.
+	for _, cb := range commandBuffers {
+		if cb == nil || cb.halEncoder == nil {
+			continue
 		}
+		halEnc := cb.halEncoder
+		halCmdBuf := cb.halBuffer()
+		cb.halEncoder = nil // ownership moves to deferred callback
+
+		pool := q.device.cmdEncoderPool
+		dq.Defer(subIdx, "CmdEncoder", func() {
+			halEnc.ResetAll([]hal.CommandBuffer{halCmdBuf})
+			pool.release(halEnc)
+		})
 	}
 
 	// Triage deferred resource destructions from the DestroyQueue.
 	// Resources whose GPU submissions have completed are now safe to destroy.
-	if dq := q.destroyQueue(); dq != nil {
-		dq.Triage(q.hal.PollCompleted())
-	}
-
-	return subIdx, nil
+	dq.Triage(q.hal.PollCompleted())
 }
 
 // Poll returns the last completed submission index. Non-blocking.
@@ -148,14 +180,13 @@ func (q *Queue) WriteBuffer(buffer *Buffer, offset uint64, data []byte) error {
 		return fmt.Errorf("wgpu: WriteBuffer: no HAL buffer")
 	}
 
-	// MapWrite buffers live on upload heap (DX12) or host-visible memory (Vulkan).
-	// They support direct CPU writes — no staging buffer or GPU copy needed.
-	// CopyBufferRegion into DX12 upload heap is undefined behavior (GENERIC_READ
-	// is read-only to GPU), so we MUST bypass PendingWrites for these buffers.
-	if buffer.Usage()&gputypes.BufferUsageMapWrite != 0 {
-		return q.hal.WriteBuffer(halBuffer, offset, data)
-	}
-
+	// Always route through PendingWrites staging belt when available.
+	// Rust wgpu-core write_buffer() (queue.rs:549) ALWAYS creates a StagingBuffer,
+	// even for MapWrite buffers. Data is immutable in staging until GPU completion.
+	// This prevents data races when CPU overwrites while GPU reads (BUG-METAL-001).
+	//
+	// DX12: MapWrite buffers now use HEAP_TYPE_CUSTOM with WRITE_COMBINE + COMMON
+	// state (matching Rust suballocation.rs:437), allowing CopyBufferRegion as dst.
 	if q.pending != nil {
 		return q.pending.writeBuffer(halBuffer, buffer.Usage(), offset, data)
 	}

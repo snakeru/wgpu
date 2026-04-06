@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.1] - 2026-04-07
+
+### Fixed
+
+#### Metal
+
+- **Actual GPU completion tracking via addCompletedHandler** — `PollCompleted()`
+  returned a conservative heuristic (`submissionIndex - maxFramesInFlight`)
+  causing `maintain()` to recycle staging belt chunks before GPU finished using
+  them. Now uses `atomic.Uint64` updated by Metal completion handler — same
+  pattern as Rust wgpu-hal `Fence.completed_value`. (BUG-METAL-001 Fix #2)
+
+#### Core
+
+- **Command encoder pool — recycle HAL encoders after GPU completion** — Each
+  `CreateCommandEncoder()` created a new DX12 `ID3D12CommandAllocator` (~64KB)
+  that leaked after `Finish()`. Device-level pool acquires/releases encoders,
+  matching Rust wgpu-core `CommandAllocator` pattern. Encoder travels:
+  Pool → CommandEncoder → CommandBuffer → Submit → GPU done → ResetAll → Pool.
+  Fixes ~7.5 MB/min memory leak on DX12. (BUG-DX12-004)
+
+- **Unified single encoder pool per device** — User command encoders and
+  PendingWrites internal staging encoders now share single `encoderPool`,
+  matching Rust wgpu-core single `device.command_allocator` (allocator.rs).
+  PendingWrites borrows pool reference, does not own or destroy it.
+  (CLEANUP-ENCODER-003)
+
+- **CommandBuffer.Release()** — Explicit cleanup for non-submitted command buffers.
+  Returns HAL encoder to pool and drops tracked resource refs. Matches Rust
+  `InnerCommandEncoder::Drop` (command/mod.rs:726-738). A CommandBuffer must be
+  either Submit()'d or Release()'d to avoid encoder leak. (CLEANUP-ENCODER-001)
+
+- **Vulkan VkCommandPool double-free fix** — In pool-managed mode, CommandBuffer
+  no longer carries VkCommandPool ref (cb.pool=0). Encoder exclusively owns pool.
+  Prevents triple-free at shutdown (FreeCommandBuffer + encoder.Destroy +
+  destroyAllocators). (BUG-DX12-004)
+
+- **Shutdown order: WaitIdle → Triage → FlushAll → pool.destroy → hal.Destroy** —
+  WaitIdle ensures PollCompleted returns final index so all deferred encoder
+  recycling callbacks fire before pool destruction. Prevents vkDestroyCommandPool
+  crash on shutdown. (BUG-DX12-004)
+
+- **All WriteBuffer through staging + DX12 HEAP_TYPE_CUSTOM** — MapWrite buffers
+  bypassed PendingWrites with direct memcpy, causing data races when CPU overwrites
+  while GPU reads (texture flickering on Metal). Now ALL WriteBuffer goes through
+  staging belt on all backends. DX12 MapWrite buffers switched from
+  `D3D12_HEAP_TYPE_UPLOAD` (GENERIC_READ, can't be copy destination) to
+  `D3D12_HEAP_TYPE_CUSTOM` with `WRITE_COMBINE` + `COMMON` state (allows implicit
+  promotion to COPY_DST). Matches Rust wgpu-hal `suballocation.rs:437-464`.
+  Readback buffers also use CUSTOM heap with WRITE_BACK. (BUG-METAL-001 Fix #1)
+
 ## [0.24.0] - 2026-04-06
 
 ### Added

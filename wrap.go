@@ -38,16 +38,21 @@ func NewDeviceFromHAL(
 
 	coreDevice := core.NewDevice(halDevice, coreAdapter, features, limits, label)
 
+	// Single shared encoder pool for both user command encoders and PendingWrites.
+	pool := newEncoderPool(halDevice)
+
 	queue := &Queue{
 		hal:       halQueue,
 		halDevice: halDevice,
+		pending:   newPendingWrites(halDevice, halQueue, pool),
 	}
 
 	coreDevice.SetAssociatedQueue(&core.Queue{Label: label + " Queue"})
 
 	device := &Device{
-		core:  coreDevice,
-		queue: queue,
+		core:           coreDevice,
+		queue:          queue,
+		cmdEncoderPool: pool,
 	}
 	queue.device = device
 

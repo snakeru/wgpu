@@ -77,17 +77,23 @@ func (a *Adapter) requestDeviceHAL(desc *DeviceDescriptor) (*Device, error) {
 
 	coreDevice := core.NewDevice(openDevice.Device, a.core, features, limits, label)
 
+	// Single shared encoder pool for both user command encoders (CreateCommandEncoder)
+	// and internal staging encoders (PendingWrites). Matches Rust wgpu-core which uses
+	// one device.command_allocator for both (queue.rs:1373).
+	pool := newEncoderPool(openDevice.Device)
+
 	queue := &Queue{
 		hal:       openDevice.Queue,
 		halDevice: openDevice.Device,
-		pending:   newPendingWrites(openDevice.Device, openDevice.Queue),
+		pending:   newPendingWrites(openDevice.Device, openDevice.Queue, pool),
 	}
 
 	coreDevice.SetAssociatedQueue(&core.Queue{Label: label + " Queue"})
 
 	device := &Device{
-		core:  coreDevice,
-		queue: queue,
+		core:           coreDevice,
+		queue:          queue,
+		cmdEncoderPool: pool,
 	}
 	queue.device = device
 
