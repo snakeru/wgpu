@@ -109,11 +109,19 @@ func (q *Queue) WriteTexture(dst *hal.ImageCopyTexture, data []byte, layout *hal
 }
 
 // Present presents a surface texture to the screen.
+//
+// Before SwapBuffers, blits the Surface's swapchain offscreen FBO to the
+// default framebuffer (FBO 0) with an explicit Y-flip. User render passes
+// render upside-down into the swapchain FBO (driven by naga's in-shader
+// Y-flip); the blit un-flips for presentation. Mirrors Rust wgpu-hal
+// src/gles/egl.rs Surface::present (1280-1308).
 func (q *Queue) Present(surface hal.Surface, _ hal.SurfaceTexture) error {
 	surf, ok := surface.(*Surface)
 	if !ok {
 		return fmt.Errorf("gles: invalid surface type")
 	}
+
+	surf.blitSwapchainToDefault()
 
 	return surf.wglCtx.SwapBuffers()
 }
