@@ -8,6 +8,7 @@ package dx12
 import (
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"os"
 	"runtime"
 	"sync"
@@ -1975,6 +1976,33 @@ func hlslToDXILBindingMap(m map[hlsl.ResourceBinding]hlsl.BindTarget) dxil.Bindi
 	return out
 }
 
+func hlslToDXILSamplerBufferBindingMap(m map[uint32]hlsl.BindTarget) map[uint32]dxil.BindTarget {
+	if m == nil {
+		return nil
+	}
+	out := make(map[uint32]dxil.BindTarget, len(m))
+	for group, v := range m {
+		out[group] = dxil.BindTarget{
+			Space:    uint32(v.Space),
+			Register: v.Register,
+		}
+	}
+	return out
+}
+
+func hlslToDXILSamplerHeapTargets(t hlsl.SamplerHeapBindTargets) *dxil.SamplerHeapBindTargets {
+	return &dxil.SamplerHeapBindTargets{
+		StandardSamplers: dxil.BindTarget{
+			Space:    uint32(t.StandardSamplers.Space),
+			Register: t.StandardSamplers.Register,
+		},
+		ComparisonSamplers: dxil.BindTarget{
+			Space:    uint32(t.ComparisonSamplers.Space),
+			Register: t.ComparisonSamplers.Register,
+		},
+	}
+}
+
 // compileWGSLModuleHLSL compiles IR to per-entry-point DXBC via HLSL→FXC.
 // Pipeline: IR → HLSL → D3DCompile (d3dcompiler_47.dll) → DXBC
 func (d *Device) compileWGSLModuleHLSL(irModule *ir.Module, nagaOpts *hlsl.Options, module *ShaderModule) error {
@@ -2056,6 +2084,8 @@ func (d *Device) compileWGSLModuleDXIL(wgslSource string, irModule *ir.Module, n
 	opts := dxil.DefaultOptions()
 	if nagaOpts != nil {
 		opts.BindingMap = hlslToDXILBindingMap(nagaOpts.BindingMap)
+		opts.SamplerBufferBindingMap = hlslToDXILSamplerBufferBindingMap(nagaOpts.SamplerBufferBindingMap)
+		opts.SamplerHeapTargets = hlslToDXILSamplerHeapTargets(nagaOpts.SamplerHeapTargets)
 	}
 
 	// Compile each entry point separately by creating a single-entry-point IR module.
@@ -2210,6 +2240,13 @@ func (d *Device) CreateRenderPipeline(desc *hal.RenderPipelineDescriptor) (hal.R
 	pso, err := d.raw.CreateGraphicsPipelineState(psoDesc)
 	d.DrainDebugMessages() // Check for validation warnings/errors during PSO creation
 	if err != nil {
+		slog.Error("dx12: CreateGraphicsPipelineState failed",
+			"label", desc.Label,
+			"vs", desc.Vertex.EntryPoint,
+			"fs", func() string { if desc.Fragment != nil { return desc.Fragment.EntryPoint }; return "" }(),
+			"vertexBuffers", len(desc.Vertex.Buffers),
+			"err", err,
+		)
 		if reason := d.raw.GetDeviceRemovedReason(); reason != nil {
 			d.logDREDBreadcrumbs()
 			return nil, fmt.Errorf("dx12: CreateGraphicsPipelineState failed (device removed: %w): %w", reason, err)
@@ -2326,6 +2363,11 @@ func (d *Device) CreateComputePipeline(desc *hal.ComputePipelineDescriptor) (hal
 	pso, err := d.raw.CreateComputePipelineState(&psoDesc)
 	d.DrainDebugMessages() // Check for validation warnings/errors during PSO creation
 	if err != nil {
+		slog.Error("dx12: CreateComputePipelineState failed",
+			"label", desc.Label,
+			"entryPoint", desc.Compute.EntryPoint,
+			"err", err,
+		)
 		if reason := d.raw.GetDeviceRemovedReason(); reason != nil {
 			d.logDREDBreadcrumbs()
 			return nil, fmt.Errorf("dx12: CreateComputePipelineState failed (device removed: %w): %w", reason, err)
