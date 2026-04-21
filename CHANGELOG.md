@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.2] - 2026-04-21
+
+### Dependencies
+
+- **gputypes** v0.4.0 → **v0.5.0** — PrimitiveState zero value = WebGPU spec default (breaking
+  enum renumber in gputypes). Go zero-init now produces correct defaults without explicit field
+  assignment. Aligns with gpucontext v0.13.0.
+
 ## [0.25.1] - 2026-04-21
 
 ### Added
