@@ -23,6 +23,7 @@ import (
 	"image/png"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gogpu/gputypes"
@@ -154,6 +155,21 @@ func run(outputPath string) error {
 	}
 	defer stagingBuf.Release()
 
+	if err := renderTriangle(device, view, texture, stagingBuf, bytesPerRow); err != nil {
+		return err
+	}
+
+	pixels, err := readbackPixels(device, stagingBuf, bufferSize)
+	if err != nil {
+		return err
+	}
+
+	return writeImage(filepath.Clean(outputPath), pixels, bytesPerRow)
+}
+
+// renderTriangle creates the shader/pipeline, records a render pass drawing a
+// triangle, copies the result into stagingBuf, and submits to the GPU.
+func renderTriangle(device *wgpu.Device, view *wgpu.TextureView, texture *wgpu.Texture, stagingBuf *wgpu.Buffer, bytesPerRow uint32) error {
 	wgsl, shaderName := pickShader()
 	fmt.Printf("Shader: %s\n", shaderName)
 	shader, err := device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{
@@ -252,24 +268,34 @@ func run(outputPath string) error {
 	if _, err := device.Queue().Submit(cmd); err != nil {
 		return fmt.Errorf("submit: %w", err)
 	}
+	return nil
+}
 
+// readbackPixels maps the staging buffer and copies the pixel data to a byte slice.
+func readbackPixels(device *wgpu.Device, stagingBuf *wgpu.Buffer, bufferSize uint64) ([]byte, error) {
+	_ = device // reserved for future use (e.g. device.Poll)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := stagingBuf.Map(ctx, wgpu.MapModeRead, 0, bufferSize); err != nil {
-		return fmt.Errorf("map staging: %w", err)
+		return nil, fmt.Errorf("map staging: %w", err)
 	}
 	rng, err := stagingBuf.MappedRange(0, bufferSize)
 	if err != nil {
 		_ = stagingBuf.Unmap()
-		return fmt.Errorf("mapped range: %w", err)
+		return nil, fmt.Errorf("mapped range: %w", err)
 	}
 
 	pixels := make([]byte, bufferSize)
 	copy(pixels, rng.Bytes())
 	if err := stagingBuf.Unmap(); err != nil {
-		return fmt.Errorf("unmap: %w", err)
+		return nil, fmt.Errorf("unmap: %w", err)
 	}
+	return pixels, nil
+}
 
+// writeImage converts raw RGBA pixels to a PNG file and verifies the triangle
+// rendered non-background pixels.
+func writeImage(outputPath string, pixels []byte, bytesPerRow uint32) error {
 	img := image.NewNRGBA(image.Rect(0, 0, texWidth, texHeight))
 	nonBg := 0
 	for y := 0; y < texHeight; y++ {
@@ -289,15 +315,14 @@ func run(outputPath string) error {
 	if err := png.Encode(&buf, img); err != nil {
 		return fmt.Errorf("encode png: %w", err)
 	}
-	if err := os.WriteFile(outputPath, buf.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(outputPath, buf.Bytes(), 0o600); err != nil {
 		return fmt.Errorf("write png: %w", err)
 	}
 	fmt.Printf("PNG written: %s (%d bytes)\n", outputPath, buf.Len())
 	fmt.Printf("Non-background pixels: %d / %d\n", nonBg, texWidth*texHeight)
 
 	if nonBg == 0 {
-		fmt.Println("WARNING: no non-background pixels — triangle did not render")
-		os.Exit(2)
+		return fmt.Errorf("no non-background pixels — triangle did not render")
 	}
 	fmt.Println("SUCCESS: triangle visible in output")
 	return nil

@@ -221,14 +221,13 @@ func (q *Queue) writeBufferStaged(buf *Buffer, offset uint64, data []byte) error
 	_ = MsgSend(blitEncoder, Sel("endEncoding"))
 
 	// Try async release via completion handler (same pattern as WriteTexture).
-	blockPtr, blockID := newCompletedHandlerBlock(staging)
+	blockPtr := newCompletedHandlerBlock(staging)
 	if blockPtr != 0 {
 		_ = MsgSend(cmdBuffer, Sel("addCompletedHandler:"), blockPtr)
 		_ = MsgSend(cmdBuffer, Sel("commit"))
 		Release(cmdBuffer)
 		// Block is pinned via blockPinRegistry until the completion callback
 		// fires and unpins it. No runtime.KeepAlive needed.
-		_ = blockID
 		return nil
 	}
 
@@ -316,7 +315,7 @@ func (q *Queue) WriteTexture(dst *hal.ImageCopyTexture, data []byte, layout *hal
 
 	msgSendVoid(blitEncoder, Sel("copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:"),
 		argPointer(uintptr(stagingBuffer)),
-		argUint64(uint64(layout.Offset)),
+		argUint64(layout.Offset),
 		argUint64(uint64(bytesPerRow)),
 		argUint64(uint64(bytesPerImage)),
 		argStruct(sourceSize, mtlSizeType),
@@ -331,7 +330,7 @@ func (q *Queue) WriteTexture(dst *hal.ImageCopyTexture, data []byte, layout *hal
 	// Try async path: register a completion handler to release the staging
 	// buffer when the GPU finishes the blit. This avoids a full pipeline stall
 	// that waitUntilCompleted causes (multi-ms per 4K texture).
-	blockPtr, blockID := newCompletedHandlerBlock(stagingBuffer)
+	blockPtr := newCompletedHandlerBlock(stagingBuffer)
 	if blockPtr != 0 {
 		// Register completion handler BEFORE commit.
 		// addCompletedHandler: retains the command buffer internally.
@@ -346,7 +345,6 @@ func (q *Queue) WriteTexture(dst *hal.ImageCopyTexture, data []byte, layout *hal
 
 		// Block is pinned via blockPinRegistry until the completion callback
 		// fires and unpins it. No runtime.KeepAlive needed.
-		_ = blockID
 
 		hal.Logger().Debug("metal: WriteTexture committed (async)",
 			"width", size.Width,

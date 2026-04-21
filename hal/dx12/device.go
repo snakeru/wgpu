@@ -2243,7 +2243,12 @@ func (d *Device) CreateRenderPipeline(desc *hal.RenderPipelineDescriptor) (hal.R
 		slog.Error("dx12: CreateGraphicsPipelineState failed",
 			"label", desc.Label,
 			"vs", desc.Vertex.EntryPoint,
-			"fs", func() string { if desc.Fragment != nil { return desc.Fragment.EntryPoint }; return "" }(),
+			"fs", func() string {
+				if desc.Fragment != nil {
+					return desc.Fragment.EntryPoint
+				}
+				return ""
+			}(),
 			"vertexBuffers", len(desc.Vertex.Buffers),
 			"err", err,
 		)

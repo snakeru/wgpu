@@ -334,6 +334,18 @@ import _ "github.com/gogpu/wgpu/hal/software"
 
 ---
 
+## Environment Variables
+
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `GOGPU_DX12_DXIL` | `1` | Enable DXIL direct compilation on DX12 (experimental). Bypasses HLSL→FXC, generates DXIL bytecode directly from naga IR. SM 6.0+, zero external dependencies. Default: off (uses HLSL→FXC). |
+| `GOGPU_DX12_DXIL_OVERRIDE_VS` | file path | Replace vertex shader DXIL with contents of the given file. For debugging only. |
+| `GOGPU_DX12_DXIL_OVERRIDE_PS` | file path | Replace pixel shader DXIL with contents of the given file. For debugging only. |
+
+> **Note:** Backend selection (`GOGPU_GRAPHICS_API`) is handled by `gogpu` (the app framework), not by `wgpu` directly. See [gogpu documentation](https://github.com/gogpu/gogpu) for `GOGPU_GRAPHICS_API=vulkan|dx12|metal|gles|software`.
+
+---
+
 ## Ecosystem
 
 **wgpu** is the foundation of the [GoGPU](https://github.com/gogpu) ecosystem.

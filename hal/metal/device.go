@@ -23,6 +23,9 @@ import (
 // This maximizes the gap between uniform/storage buffers and vertex buffers.
 const maxVertexBuffers = 31
 
+// unknownError is the default error message when Metal returns a nil NSError.
+const unknownError = "unknown error"
+
 // Device implements hal.Device for Metal.
 type Device struct {
 	raw           ID // id<MTLDevice>
@@ -464,7 +467,7 @@ func (d *Device) DestroyPipelineLayout(layout hal.PipelineLayout) {
 // CreateShaderModule creates a shader module.
 func (d *Device) CreateShaderModule(desc *hal.ShaderModuleDescriptor) (hal.ShaderModule, error) {
 	// If WGSL source is provided, compile to MSL
-	if desc.Source.WGSL != "" {
+	if desc.Source.WGSL != "" { //nolint:nestif // WGSL→MSL pipeline is sequential; splitting would scatter coupled logic
 		start := time.Now()
 
 		// Parse WGSL to AST
@@ -504,7 +507,7 @@ func (d *Device) CreateShaderModule(desc *hal.ShaderModuleDescriptor) (hal.Shade
 			uintptr(mslString), 0, uintptr(unsafe.Pointer(&errorPtr)))
 
 		if library == 0 {
-			errMsg := "unknown error"
+			errMsg := unknownError
 			if errorPtr != 0 {
 				if details := formatNSError(errorPtr); details != "" {
 					errMsg = details
@@ -690,7 +693,7 @@ func (d *Device) CreateRenderPipeline(desc *hal.RenderPipelineDescriptor) (hal.R
 		uintptr(pipelineDesc), uintptr(unsafe.Pointer(&errorPtr)))
 
 	if pipelineState == 0 {
-		errMsg := "unknown error"
+		errMsg := unknownError
 		if errorPtr != 0 {
 			errDesc := MsgSend(errorPtr, Sel("localizedDescription"))
 			if errDesc != 0 {
@@ -797,7 +800,7 @@ func (d *Device) CreateComputePipeline(desc *hal.ComputePipelineDescriptor) (hal
 		uintptr(computeFunc), uintptr(unsafe.Pointer(&errorPtr)))
 
 	if pipelineState == 0 {
-		errMsg := "unknown error"
+		errMsg := unknownError
 		if errorPtr != 0 {
 			errDesc := MsgSend(errorPtr, Sel("localizedDescription"))
 			if errDesc != 0 {
@@ -956,7 +959,7 @@ func (d *Device) Wait(fence hal.Fence, value uint64, timeout time.Duration) (boo
 	}
 
 	// Try event-driven path using MTLSharedEvent notification.
-	if result, err, attempted := d.waitEventDriven(mtlFence, value, timeout); attempted {
+	if result, attempted, err := d.waitEventDriven(mtlFence, value, timeout); attempted {
 		return result, err
 	}
 
@@ -965,18 +968,18 @@ func (d *Device) Wait(fence hal.Fence, value uint64, timeout time.Duration) (boo
 }
 
 // waitEventDriven attempts to wait using MTLSharedEvent.notifyListener:atValue:block:.
-// Returns (result, error, true) if the event-driven path was used.
-// Returns (false, nil, false) if the path is unavailable and caller should fall back.
-func (d *Device) waitEventDriven(mtlFence *Fence, value uint64, timeout time.Duration) (bool, error, bool) {
+// Returns (result, true, nil/error) if the event-driven path was used.
+// Returns (false, false, nil) if the path is unavailable and caller should fall back.
+func (d *Device) waitEventDriven(mtlFence *Fence, value uint64, timeout time.Duration) (bool, bool, error) {
 	hal.Logger().Debug("metal: Wait", "value", value, "timeout", timeout, "path", "event-driven")
 	listener := d.getOrCreateEventListener()
 	if listener == 0 {
-		return false, nil, false
+		return false, false, nil
 	}
 
 	blockPtr, blockID, done := newSharedEventNotificationBlock()
 	if blockPtr == 0 {
-		return false, nil, false
+		return false, false, nil
 	}
 	defer releaseBlock(blockID)
 
@@ -995,15 +998,15 @@ func (d *Device) waitEventDriven(mtlFence *Fence, value uint64, timeout time.Dur
 	// Wait for the callback or timeout.
 	select {
 	case <-done:
-		return true, nil, true
+		return true, true, nil
 	case <-time.After(timeout):
 		// Timeout — check once more in case the event fired between
 		// the select evaluation and now.
 		select {
 		case <-done:
-			return true, nil, true
+			return true, true, nil
 		default:
-			return false, nil, true
+			return false, true, nil
 		}
 	}
 }
@@ -1150,7 +1153,8 @@ func extractWorkgroupSizes(module *ir.Module) map[string][3]uint32 {
 		return nil
 	}
 	result := make(map[string][3]uint32)
-	for _, ep := range module.EntryPoints {
+	for i := range module.EntryPoints {
+		ep := &module.EntryPoints[i]
 		if ep.Stage == ir.StageCompute {
 			result[ep.Name] = ep.Workgroup
 		}

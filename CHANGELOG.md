@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.25.0] - 2026-04-13
+## [0.25.0] - 2026-04-21
 
 ### Added
 
@@ -66,6 +66,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slice plus `glMapBuffer` fallback; software returns a slice pointer; noop reuses its
   in-memory backing storage.
 
+- **GLES: swapchain offscreen FBO + Present Y-flip blit** (BUG-GLES-YFLIP-001) — added the
+  missing swapchain FBO architecture matching Rust wgpu-hal/gles. Previously, non-MSAA
+  render-to-surface paths rendered upside-down because GLES Y-axis is inverted vs WebGPU.
+  Now all GLES rendering goes through an offscreen FBO with a Y-flipping blit at Present time.
+- **DX12: in-process DXIL validation + BindingMap plumbing** — naga IR → DXIL direct
+  compilation pipeline with register binding remapping matching the root signature layout.
+  Enables `GOGPU_DX12_DXIL=1` for compute and graphics pipelines.
+- **DX12: sampler heap plumbing for DXIL** (BUG-DXIL-028) — forward `SamplerBufferBindingMap`
+  and `SamplerHeapTargets` from HLSL options to DXIL options so texture/sampler pipelines
+  match the root signature. Without this, any DXIL shader using textures/samplers got
+  `E_INVALIDARG` from `CreateGraphicsPipelineState`.
+- **DX12: pipeline error logging** — `CreateGraphicsPipelineState` and
+  `CreateComputePipelineState` failures now log via `slog.Error` with pipeline label,
+  entry points, and HRESULT. Previously errors were silently swallowed because
+  `hal.Logger()` defaults to nop.
+- **DX12: headless triangle example** — `examples/triangle-headless` for DXIL debugging
+  with `GOGPU_DX12_DXIL_OVERRIDE_VS` / `GOGPU_DX12_DXIL_OVERRIDE_PS` env-var hooks.
+- **DX12: ID3D12InfoQueue.GetMessage** now accepts `S_FALSE` on size query (was incorrectly
+  treated as error).
+
 ### Fixed
 
 - **DX12 compute readback data race** — the removed `Queue.ReadBuffer` mapped the staging
@@ -102,6 +122,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All three in-repo examples (`compute-copy`, `compute-sum`, `compute-particles`) migrated
   to the new API. Downstream repos (`gogpu/gg`, `gogpu/gogpu`, `gogpu/ui`, `gogpu/g3d`) have
   separate migration tasks in their kanban.
+
+### Dependencies
+
+- **naga** v0.17.3 → **v0.17.4** — DXIL full rendering (55 commits: DCE pass, inline pass,
+  mem2reg, phi promotion, sampler heap config, CBV struct layout, register packing).
+  First Pure Go DXIL generator that renders full 2D applications (text, SDF shapes, widgets).
 
 ## [0.24.7] - 2026-04-11
 

@@ -19,7 +19,7 @@
 
 ---
 
-## Current State: v0.23.8
+## Current State: v0.25.0
 
 ✅ **All 5 HAL backends complete** (~127K LOC)
 ✅ **Three-layer WebGPU stack** — wgpu API → wgpu/core → wgpu/hal
@@ -33,9 +33,13 @@
 ✅ **Per-command-buffer resource tracking** — Clone/Drop in encoders (Rust EncoderInFlight)
 ✅ **DX12 HLSL shader cache** — in-memory SHA-256 keyed, LRU eviction
 ✅ **DX12 DRED diagnostics** — auto-breadcrumbs + page fault tracking on TDR
-✅ **DX12 DXIL direct compilation** — naga DXIL backend, SM 6.0+, zero external dependencies, first Pure Go DXIL
+✅ **DX12 DXIL direct compilation** — naga DXIL backend, SM 6.0+, zero external dependencies, first Pure Go DXIL generator. Full 2D rendering (text, SDF shapes, widgets) verified on Intel Iris Xe.
 ✅ **Blend constant draw-time validation** — Rust wgpu-core OptionalState pattern
 ✅ **Vulkan fence pool recycling** — matches Rust wgpu-hal maintain() before submit
+✅ **WebGPU Buffer mapping API** — `Buffer.Map`/`MapAsync`/`MappedRange`/`Unmap`, `Device.Poll`
+✅ **GLES Y-flip fix** — swapchain offscreen FBO + Present blit (Rust wgpu-hal parity)
+✅ **Encoder pool** — per-Device shared pool (Rust CommandAllocator pattern)
+✅ **Software DWM-safe presentation** — CreateDIBSection+BitBlt (SDL3/Qt6 pattern)
 
 ### Remaining validation (planned)
 - Late buffer binding size (SPIR-V reflection → min binding size)
@@ -54,31 +58,27 @@
 
 ## Upcoming
 
-### Next: v0.25.0
+### Next: v0.26.0
 
 - [ ] DX12 DeviceTextureTracker for proper barrier state tracking
-- [x] GLES BindingMap refactor → per-type sequential counters (v0.23.8)
 - [ ] GLES global UNPACK_ALIGNMENT=1 (Rust pattern — set once at device open)
 - [ ] Vulkan relay semaphores for multi-submission ordering (VK-SYNC-001)
-
-### v0.25.0 — WebGPU Compliance
-
-- [x] Blend constant tracking (pipeline blend state → draw-time check)
-- [x] Resource usage conflict detection (BufferTracker with UsageConflictError)
-- [ ] Full render/compute pass validation (resource transitions)
-- [ ] Late buffer binding size validation (SPIR-V reflection → min binding size)
 - [ ] GetSurfaceCapabilities on all backends (currently Vulkan-only)
+- [ ] DXIL as default DX12 shader path (currently opt-in via `GOGPU_DX12_DXIL=1`)
 
 ### v1.0.0 — Production Release
 
 - [ ] Full WebGPU specification compliance
-- [ ] Compute shader support in all backends (Metal compute pending)
 - [ ] API stability guarantee
+- [x] Compute shader support in all GPU backends (Vulkan, DX12, Metal, GLES)
 - [x] Performance benchmarks — 115+ benchmarks, hot-path allocation optimization
 - [x] Enterprise fence architecture — HAL owns fences, SubmissionIndex tracking
 - [x] PendingWrites batching — Rust wgpu-core pattern
 - [x] Public API root package — safe, ergonomic user-facing API
 - [x] Text rendering on all GPU backends
+- [x] Blend constant tracking + resource usage conflict detection
+- [ ] Full render/compute pass validation (resource transitions)
+- [ ] Late buffer binding size validation (SPIR-V reflection → min binding size)
 - [ ] Comprehensive documentation
 - [ ] Conformance test suite
 
@@ -124,7 +124,7 @@
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **v0.25.0** | 2026-04 | **WebGPU-compliant Buffer mapping API** (`Buffer.Map`/`MapAsync`/`MappedRange`/`Unmap`, `Device.Poll`). Fixes DX12 compute readback data race. Removes `Queue.ReadBuffer`. Zero-alloc primary path. See [ADR](docs/dev/research/ADR-BUFFER-MAPPING-API.md). |
+| **v0.25.0** | 2026-04 | **WebGPU Buffer mapping API**, **DXIL full rendering** (naga v0.17.4), GLES Y-flip fix, sampler heap plumbing, pipeline error logging. Breaking: `Queue.ReadBuffer` removed. |
 | **v0.24.7** | 2026-04 | DWM-safe software presentation (CreateDIBSection+BitBlt), rendering optimizations |
 | **v0.23.8** | 2026-04 | Metal vertex buffer fix, GLES per-type binding counters, StagingBelt alignment |
 | **v0.23.7** | 2026-04 | naga v0.16.4 (HLSL 72/72 parity, 330× faster FXC array init) |
