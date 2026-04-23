@@ -1172,13 +1172,16 @@ func (d *Device) acquireAllocator() (commandAllocator, error) {
 	return commandAllocator{pool: pool}, nil
 }
 
-// recyclePool returns a command pool back to the free list for reuse.
-// The pool is NOT reset here — the encoder's ResetAll handles that,
-// or acquireAllocator can reset lazily if needed.
+// recyclePool resets a command pool and returns it to the free list for reuse.
+// vkResetCommandPool returns all allocated command buffers to the "initial" state,
+// allowing them to be re-allocated by the next encoder that acquires this pool.
+// Without this reset, vkAllocateCommandBuffers may return CBs still in
+// "executable" state, causing VUID-vkBeginCommandBuffer-commandBuffer-00049.
 func (d *Device) recyclePool(pool vk.CommandPool) {
 	if pool == 0 {
 		return
 	}
+	d.cmds.ResetCommandPool(d.handle, pool, 0)
 	d.allocatorMu.Lock()
 	d.freeAllocators = append(d.freeAllocators, commandAllocator{pool: pool})
 	d.allocatorMu.Unlock()
