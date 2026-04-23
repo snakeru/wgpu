@@ -150,10 +150,22 @@ func (a *Adapter) Open(features gputypes.Features, limits gputypes.Limits) (hal.
 		return hal.OpenDevice{}, fmt.Errorf("vulkan: failed to initialize allocator: %w", err)
 	}
 
+	// VK-SYNC-001: Create relay semaphores for GPU-side submission ordering.
+	// This ensures consecutive vkQueueSubmit calls execute in order on the GPU,
+	// which is required by the wgpu_hal Queue trait but not guaranteed by Vulkan.
+	relay, err := newRelaySemaphores(dev.cmds, dev.handle)
+	if err != nil {
+		dev.allocator.Destroy()
+		dev.timelineFence.destroy(dev.cmds, dev.handle)
+		vkDestroyDevice(device, nil)
+		return hal.OpenDevice{}, fmt.Errorf("vulkan: failed to create relay semaphores: %w", err)
+	}
+
 	q := &Queue{
 		handle:      queue,
 		device:      dev,
 		familyIndex: uint32(graphicsFamily),
+		relay:       relay,
 	}
 
 	// Store queue reference in device for swapchain synchronization
